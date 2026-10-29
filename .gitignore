@@ -1,0 +1,16 @@
+# Your own deployment: keys, tokens, the pairing key and server address. Never commit these.
+config.json
+certs/
+dist/
+relay/web/ca.crt
+host.log*
+
+# Build output (python setup.py build_ext --inplace)
+*.pyd
+*.so
+build/
+native/capture.cpp
+native/winput.c
+
+__pycache__/
+.ruff_cache/

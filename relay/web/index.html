@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover,interactive-widget=resizes-visual">
+<meta name="theme-color" content="#000000">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="MiniDesk">
+<link rel="manifest" href="s/manifest.json">
+<link rel="icon" href="s/icon.svg">
+<link rel="apple-touch-icon" href="s/icon.svg">
+<title>MiniDesk</title>
+<style>
+  :root { --panel: rgba(28, 28, 30, .94); --btn: rgba(255, 255, 255, .12); --accent: #0a84ff; --muted: #98989f; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    position: fixed; inset: 0; margin: 0; overflow: hidden; overscroll-behavior: none; touch-action: none;
+    background: #000; color: #fff; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+    font: 15px/1.45 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  button { font: inherit; color: inherit; border: 0; border-radius: 10px; background: var(--btn); padding: 9px 12px; cursor: pointer; }
+  button.on { background: var(--accent); }
+  a { color: var(--accent); }
+  #stage { position: fixed; inset: 0; overflow: hidden; touch-action: none; }
+  #screen { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  #cursor { position: absolute; left: 0; top: 0; pointer-events: none; display: none; filter: drop-shadow(0 1px 1px rgba(0, 0, 0, .6)); }
+
+  .ripple {
+    position: absolute; width: 36px; height: 36px; margin: -18px 0 0 -18px; border-radius: 50%; pointer-events: none;
+    border: 2px solid rgba(255, 255, 255, .9); animation: ripple .35s ease-out forwards;
+  }
+  .ripple.right { border-color: #ffd60a; }
+  .ripple.hold { width: 56px; height: 56px; margin: -28px 0 0 -28px; border-color: var(--accent); animation-duration: .5s; }
+  @keyframes ripple { from { transform: scale(.4); opacity: 1; } to { transform: scale(1); opacity: 0; } }
+
+  #dock { position: fixed; left: 0; top: 0; display: flex; flex-direction: column; gap: 10px; touch-action: none; }
+  #dock button {
+    position: relative; width: 44px; height: 44px; padding: 0; border-radius: 22px; font-size: 18px;
+    background: rgba(0, 0, 0, .5); border: 1px solid rgba(255, 255, 255, .25); opacity: .7; touch-action: none;
+  }
+  #dock button.on { background: var(--accent); opacity: 1; }
+  #fab::after {
+    content: ""; position: absolute; right: 3px; top: 3px; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--dot, #8e8e93); box-shadow: 0 0 0 1.5px rgba(0, 0, 0, .6);
+  }
+  #panel { position: fixed; left: 0; top: 0; width: 256px; padding: 12px; border-radius: 16px; background: var(--panel); display: none; }
+  #panel.show { display: block; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+  .row.three { grid-template-columns: 1fr 1fr 1fr; }
+  .label { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin: 4px 2px 6px; }
+  input[type=range] { width: 100%; margin: 0 0 10px; accent-color: var(--accent); }
+  #stats { color: var(--muted); font: 12px ui-monospace, Menlo, Consolas, monospace; margin: 2px; }
+
+  #toast {
+    position: fixed; left: 50%; top: calc(env(safe-area-inset-top) + 12px); transform: translateX(-50%); max-width: 80vw;
+    padding: 7px 14px; border-radius: 18px; background: var(--panel); font-size: 14px; pointer-events: none;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #toast[hidden] { display: none; }
+
+  #kbd { position: fixed; left: 0; right: 0; bottom: 0; display: none; }
+  #kbd.show { display: block; }
+  #keys {
+    display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; background: var(--panel);
+    padding: 6px calc(env(safe-area-inset-right) + 6px) calc(env(safe-area-inset-bottom) + 6px) calc(env(safe-area-inset-left) + 6px);
+  }
+  #keys::-webkit-scrollbar { display: none; }
+  #keys button { flex: none; min-width: 46px; padding: 9px 11px; font-size: 14px; }
+  #preview {
+    position: absolute; left: 50%; bottom: calc(100% + 8px); transform: translateX(-50%); max-width: 90vw;
+    padding: 6px 14px; border-radius: 10px; background: var(--panel); font-size: 18px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none;
+  }
+  #preview[hidden] { display: none; }
+  #ime { position: fixed; left: 0; bottom: 0; width: 2px; height: 2px; opacity: 0; border: 0; padding: 0; resize: none; font-size: 16px; }
+
+  #msg {
+    position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 14px; padding: 24px; text-align: center; background: #000;
+  }
+  #msg[hidden] { display: none; }
+  #msg .text { max-width: 420px; color: #e5e5ea; }
+  #msg .actions { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+  #msg button { padding: 11px 18px; }
+  #msg code { background: var(--btn); padding: 2px 6px; border-radius: 6px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="screen" width="16" height="9"></canvas>
+  <svg id="cursor" width="22" height="22" viewBox="0 0 22 22"><path d="M1 1 L1 17 L5.5 13 L8.5 20 L11.5 18.7 L8.6 12 L14.5 12 Z" fill="#fff" stroke="#000" stroke-width="1.2" stroke-linejoin="round"/></svg>
+</div>
+<div id="toast" hidden></div>
+<div id="dock"><button id="fab" aria-label="菜单">☰</button><button id="kbtn" aria-label="键盘">⌨</button></div>
+<div id="panel">
+  <div class="row"><button data-act="mode" id="mode"></button><button data-act="fit">适应屏幕</button></div>
+  <div class="row"><button data-act="full">全屏</button><button data-act="stats">统计</button></div>
+  <div id="lan" hidden>
+    <div class="label"><span>和电脑在同一 Wi-Fi？局域网直连更快</span></div>
+    <div class="row" id="lanbtns"></div>
+  </div>
+  <div class="label"><span>画质上限（网络差时自动降低）</span></div>
+  <div class="row three" id="quality"><button data-q="0">流畅</button><button data-q="1">高清</button><button data-q="2">超清</button></div>
+  <div class="label"><span>触控板灵敏度</span><span id="sensv"></span></div>
+  <input type="range" id="sens" min="0.5" max="2" step="0.1">
+  <div class="row"><button data-act="close" style="grid-column: span 2">断开连接</button></div>
+  <div id="stats" hidden></div>
+</div>
+<div id="kbd"><div id="preview" hidden></div><div id="keys"></div></div>
+<textarea id="ime" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="enter"></textarea>
+<div id="msg"><div class="text">加载中…</div><div class="actions"></div></div>
+<script src="s/app.js"></script>
+</body>
+</html>
