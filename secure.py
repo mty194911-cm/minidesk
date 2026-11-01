@@ -6,7 +6,8 @@ ECDH P-256, HMAC/HKDF-SHA256, AES-256-GCM.
   C -> H  HMAC(K, "minidesk client" | T)
   keys    HKDF(ECDH, salt=K, info="minidesk session" | T) -> host->client | client->host
 
-K is the 256-bit pairing key from the QR code; the relay never sees it, so it can neither read nor impersonate.
+K is the 256-bit pairing key from the QR code. With trusted client code, the forwarding relay cannot read or
+impersonate either peer. The separately served browser JavaScript remains part of the trust boundary.
 """
 import hashlib
 import hmac
@@ -46,6 +47,8 @@ class Channel:
         return nonce[4:] + self._tx.encrypt(nonce, data, None)
 
     def open(self, data):
+        if len(data) < 24:
+            raise InvalidTag
         (n,) = struct.unpack_from(">Q", data)
         if n <= self._max - self.WINDOW or n in self._seen:
             raise InvalidTag  # replayed or too old
@@ -99,6 +102,8 @@ async def client_handshake(recv, send, key):
     nc = os.urandom(16)
     await send(cpub + nc)
     r = await recv()
+    if len(r) != PUB + 16 + 32:
+        raise AuthError("bad host hello")
     hpub, ns, tag = r[:PUB], r[PUB:PUB + 16], r[PUB + 16:]
     t = cpub + hpub + nc + ns
     if not hmac.compare_digest(tag, _mac(key, b"minidesk host", t)):

@@ -1,5 +1,5 @@
 # MiniDesk relay installer for Windows Server (2016+). Run install.cmd from the unzipped package; re-run to upgrade.
-#   - installs Python 3.12 for all users if no Python >= 3.9 is installed for all users (signature-checked)
+#   - installs Python 3.12 for all users if no Python >= 3.10 is installed for all users (signature-checked)
 #   - installs aiohttp and aioquic (UDP/WebTransport), copies the relay to C:\MiniDesk
 #   - registers the startup task "MiniDeskRelay" running as LOCAL SERVICE (restarts if it crashes)
 #   - opens the port in Windows Firewall (TCP and UDP), starts the relay and checks it is listening
@@ -24,7 +24,7 @@ function Find-Python {
     $found = foreach ($k in Get-ChildItem 'HKLM:\SOFTWARE\Python\PythonCore' -ErrorAction SilentlyContinue) {
         try { $v = [version]$k.PSChildName } catch { continue }
         $p = (Get-ItemProperty (Join-Path $k.PSPath 'InstallPath') -ErrorAction SilentlyContinue).'(default)'
-        if ($v -ge [version]'3.9' -and $p -and (Test-Path (Join-Path $p 'pythonw.exe'))) { [pscustomobject]@{ V = $v; P = $p } }
+        if ($v -ge [version]'3.10' -and $p -and (Test-Path (Join-Path $p 'pythonw.exe'))) { [pscustomobject]@{ V = $v; P = $p } }
     }
     ($found | Sort-Object V -Descending | Select-Object -First 1).P
 }
@@ -40,7 +40,7 @@ if (-not $py) {
     if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Python Software Foundation') {
         throw "Python installer signature check failed: $($sig.Status) $($sig.SignerCertificate.Subject)"
     }
-    Start-Process $exe -Wait -ArgumentList '/quiet', 'InstallAllUsers=1', 'PrependPath=1', 'Include_test=0', 'Include_launcher=0'
+    Start-Process $exe -Wait -WindowStyle Hidden -ArgumentList '/quiet', 'InstallAllUsers=1', 'PrependPath=1', 'Include_test=0', 'Include_launcher=0'
     Remove-Item $exe
     $py = Find-Python
     if (-not $py) { throw 'Python installation failed' }
@@ -48,18 +48,27 @@ if (-not $py) {
 Write-Host "      $py"
 
 Write-Host '[2/5] aiohttp, aioquic'
+New-Item -ItemType Directory -Force $Dir | Out-Null
+# Build a fresh environment before stopping the running service. Loaded native DLLs stay untouched.
+$venv = Join-Path $Dir ('venv-' + [Guid]::NewGuid().ToString('N'))
+& (Join-Path $py 'python.exe') -m venv $venv
+if ($LASTEXITCODE) { throw 'Creating the relay virtual environment failed' }
+$servicePython = Join-Path $venv 'Scripts\python.exe'
 # aioquic pinned to versions tested with quic.py (it uses a few aioquic internals; 1.7 also changed an API)
-& (Join-Path $py 'python.exe') -m pip install --quiet --disable-pip-version-check --upgrade aiohttp "aioquic>=1.3,<1.8"
+& $servicePython -m pip install --quiet --disable-pip-version-check --upgrade -r (Join-Path $src 'requirements.txt')
 if ($LASTEXITCODE) { throw 'pip install aiohttp aioquic failed' }
+& $servicePython -m pip check
+if ($LASTEXITCODE) { throw 'Relay dependency validation failed' }
 
 Write-Host "[3/5] files -> $Dir"
 Stop-ScheduledTask -TaskName $Task -ErrorAction SilentlyContinue  # upgrade: stop the old relay first
 New-Item -ItemType Directory -Force (Join-Path $Dir 'logs') | Out-Null
-Copy-Item -Recurse -Force (Join-Path $src 'relay.py'), (Join-Path $src 'quic.py'), (Join-Path $src 'web'), (Join-Path $src 'server.crt'), (Join-Path $src 'server.key') $Dir
+Copy-Item -Recurse -Force (Join-Path $src 'relay.py'), (Join-Path $src 'quic.py'), (Join-Path $src 'limits.py'), (Join-Path $src 'requirements.txt'), (Join-Path $src 'web'), (Join-Path $src 'server.crt'), (Join-Path $src 'server.key'), (Join-Path $src 'relay.json') $Dir
 # SIDs, not names: account names are localized. S-1-5-19 LOCAL SERVICE, S-1-5-18 SYSTEM, S-1-5-32-544 Administrators
 icacls $Dir /grant '*S-1-5-19:(OI)(CI)RX' /Q | Out-Null
 icacls (Join-Path $Dir 'logs') /grant '*S-1-5-19:(OI)(CI)M' /Q | Out-Null
 icacls (Join-Path $Dir 'server.key') /inheritance:r /grant:r '*S-1-5-19:R' '*S-1-5-18:F' '*S-1-5-32-544:F' /Q | Out-Null
+icacls (Join-Path $Dir 'relay.json') /inheritance:r /grant:r '*S-1-5-19:R' '*S-1-5-18:F' '*S-1-5-32-544:F' /Q | Out-Null
 
 Write-Host "[4/5] firewall + startup task (port $port)"
 for ($i = 0; $i -lt 10 -and ($busy = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue); $i++) {
@@ -73,9 +82,9 @@ Remove-NetFirewallRule -DisplayName 'MiniDesk Relay' -ErrorAction SilentlyContin
 New-NetFirewallRule -DisplayName 'MiniDesk Relay' -Direction Inbound -Protocol TCP -LocalPort $port -Action Allow | Out-Null
 New-NetFirewallRule -DisplayName 'MiniDesk Relay' -Direction Inbound -Protocol UDP -LocalPort $port -Action Allow | Out-Null
 
-$relayArgs = "`"$Dir\relay.py`" --port $port --token $($conf.token) --cert `"$Dir\server.crt`" " +
+$relayArgs = "`"$Dir\relay.py`" --port $port --config `"$Dir\relay.json`" --cert `"$Dir\server.crt`" " +
              "--key `"$Dir\server.key`" --log `"$Dir\logs\relay.log`""
-$action = New-ScheduledTaskAction -Execute (Join-Path $py 'pythonw.exe') -Argument $relayArgs -WorkingDirectory $Dir
+$action = New-ScheduledTaskAction -Execute (Join-Path $venv 'Scripts\pythonw.exe') -Argument $relayArgs -WorkingDirectory $Dir
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $account = (New-Object Security.Principal.SecurityIdentifier 'S-1-5-19').Translate([Security.Principal.NTAccount]).Value
 $principal = New-ScheduledTaskPrincipal -UserId $account -LogonType ServiceAccount

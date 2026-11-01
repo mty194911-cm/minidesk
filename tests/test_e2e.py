@@ -3,6 +3,7 @@
 --tls serves the relay with a throwaway private CA (mkcert.py), like a domain-less deployment.
 """
 import asyncio
+import contextlib
 import os
 import secrets
 import socket
@@ -22,6 +23,7 @@ import av  # noqa: E402
 from aiohttp import web  # noqa: E402
 
 import mkcert  # noqa: E402
+from limits import STATE  # noqa: E402
 import relay  # noqa: E402
 import winput  # noqa: E402
 from host import Host, b64  # noqa: E402
@@ -75,10 +77,10 @@ async def main():
     host = Host(cfg)
     host_task = asyncio.create_task(host.run())
     for _ in range(50):
-        if "testhost01" in app["hosts"]:
+        if "testhost01" in app[STATE]["hosts"]:
             break
         await asyncio.sleep(0.05)
-    assert "testhost01" in app["hosts"], "host did not register"
+    assert "testhost01" in app[STATE]["hosts"], "host did not register"
     url = f"{ws_base}/ws/c/testhost01"
 
     if tls:  # a client that does not trust the private CA must fail
@@ -191,12 +193,16 @@ async def main():
             base = lan_urls[0].replace("wss://", "https://").rsplit("/ws", 1)[0]
             page = await (await lan.get(base + "/")).text()
             manifest = await (await lan.get(base + "/s/manifest.json")).json()
+            script = await lan.get(base + "/s/client-core.js?v=2")
+            assert "must-revalidate" in script.headers["Cache-Control"]
             assert "s/app.js" in page and "局域网" in manifest["name"], manifest
             pws, pch, _ = await connect(lan, lan_urls[0].replace("/ws", "/ws/c/testhost01"), key)
             await pws.close()
             print("web client served on the LAN port, /ws/c/<id> handshake: OK")
 
     host_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await host_task
     await runner.cleanup()
     print("ALL OK")
 

@@ -1,0 +1,8 @@
+# Known working baseline for Python 3.10+ (Windows host and relay).
+# Install after requirements.txt to reproduce the version set used by the regression suite.
+av==15.0.0
+aiohttp==3.13.2
+aioquic==1.3.0
+cryptography==46.0.5
+Cython==3.1.4
+qrcode==7.4.2

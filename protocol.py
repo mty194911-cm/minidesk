@@ -1,4 +1,4 @@
-"""Message types. Every message is one encrypted WebSocket frame: [u8 type][payload], little-endian.
+"""Message types. One encrypted message contains [u8 type][payload], little-endian, over WebSocket or QUIC.
 Mirrored in relay/web/app.js.
 """
 # host -> client

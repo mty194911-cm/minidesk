@@ -1,8 +1,8 @@
 # PC side (host.py). Tested with Python 3.10 and the versions noted.
 av>=12             # PyAV: H.264 encoding via FFmpeg (NVENC when available)   tested 15.0
-aiohttp>=3.9       # tested 3.13
+aiohttp>=3.13.2,<4 # tested 3.13.2
 aioquic>=1.3,<1.8  # UDP path to the relay; optional (without it sessions use WebSockets)   tested 1.3
-cryptography>=41   # tested 46
+cryptography>=42   # tested 46; timezone-aware certificate properties require >=42
 qrcode>=7          # tested 7.4
 
 # Building the native modules (python setup.py build_ext --inplace, MinGW-w64)

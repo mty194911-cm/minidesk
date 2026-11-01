@@ -14,6 +14,7 @@ import secrets
 import zipfile
 
 import mkcert
+from configuration import b64, read_config, save_config, validate_config
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RELAY = os.path.join(HERE, "relay")
@@ -26,19 +27,22 @@ def main():
     p.add_argument("ip", help="the server's public IP address")
     p.add_argument("--port", type=int, default=443)
     a = p.parse_args()
-    mkcert.issue(a.ip)
+    if not 1 <= a.port <= 65535:
+        p.error("端口必须在 1—65535 之间")
 
-    cfg = {}
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            cfg = json.load(f)
+    cfg = read_config(CONFIG_PATH)
     cfg["token"] = cfg.get("token") or secrets.token_urlsafe(24)
-    cfg["relay"] = f"https://{a.ip}" + ("" if a.port == 443 else f":{a.port}")
+    server = f"[{a.ip}]" if ":" in a.ip else a.ip
+    cfg["relay"] = f"https://{server}" + ("" if a.port == 443 else f":{a.port}")
+    cfg.setdefault("id", secrets.token_hex(5))
+    cfg.setdefault("key", b64(secrets.token_bytes(32)))
+    validate_config(cfg)
+    mkcert.issue(a.ip)
 
     os.makedirs(os.path.dirname(ZIP), exist_ok=True)
     with zipfile.ZipFile(ZIP, "w", zipfile.ZIP_DEFLATED) as z:
         root = "minidesk-relay/"
-        for name in ("relay.py", "quic.py", "install.ps1", "install.cmd"):
+        for name in ("relay.py", "quic.py", "limits.py", "install.ps1", "install.cmd", "requirements.txt"):
             z.write(os.path.join(RELAY, name), root + name)
         for name in sorted(os.listdir(os.path.join(RELAY, "web"))):
             z.write(os.path.join(RELAY, "web", name), root + "web/" + name)
@@ -46,8 +50,7 @@ def main():
             z.write(os.path.join(mkcert.CERTS, name), root + name)
         z.writestr(root + "relay.json", json.dumps({"token": cfg["token"], "port": a.port}))
 
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    save_config(CONFIG_PATH, cfg)
     print(f"""
 安装包已生成：{ZIP}
 1. 把这个 zip 复制到服务器上并解压（Windows 服务器可用远程桌面直接粘贴）

@@ -19,7 +19,6 @@ import queue
 import secrets
 import socket
 import ssl
-import struct
 import subprocess
 import sys
 import threading
@@ -28,11 +27,12 @@ import urllib.parse
 
 import aiohttp
 from aiohttp import web
-from cryptography.exceptions import InvalidTag
 
 import mkcert
 import winput
-from protocol import ACK, BUTTON, BYE, CONFIG, KEY, KEYFRAME, LAN, MOVE, NOTE, PING, PONG, TEXT, VIDEO, WHEEL
+from configuration import b64, read_config, save_config, unb64
+from protocol import LAN
+from session import Session
 from secure import AuthError, host_handshake
 from stream import Streamer
 
@@ -49,19 +49,12 @@ CONFIG_PATH = os.path.join(HERE, "config.json")
 CA_PATH = mkcert.CA_CRT  # private CA from mkcert.py, when the relay has no domain
 WEB_DIR = os.path.join(HERE, "relay", "web")  # the web client, also served on the LAN port
 LAN_CERT, LAN_KEY = os.path.join(mkcert.CERTS, "lan.crt"), os.path.join(mkcert.CERTS, "lan.key")
-MAX_MSG = 8 << 20
+MAX_MSG = 64 << 10  # host only receives handshake/control messages; video goes in the opposite direction
 CLOSE_KICKED, CLOSE_REPLACED = 4001, 4002  # sent as BYE: the client shows them instead of reconnecting
 SHOW_EVENT = "Local\\MiniDeskShow"  # set by a second start from the shortcut: the running one shows its window
+RESET_EVENT, RESET_DONE = "Local\\MiniDeskReset", "Local\\MiniDeskResetDone"
 GREEN, ORANGE, RED, BLUE, GRAY = "#30a14e", "#d97706", "#d70015", "#0a84ff", "#8e8e93"  # connect window
 log = logging.getLogger("host")
-
-
-def b64(b):
-    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-
-
-def unb64(s):
-    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
 _wifi_cache = {}  # sorted IP tuple -> Wi-Fi addresses among them (asking PowerShell takes ~0.5 s)
@@ -87,8 +80,11 @@ def lan_ips():
             ips.append(s.getsockname()[0])
         except OSError:
             pass
-    for *_, addr in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-        ips.append(addr[0])
+    try:
+        for *_, addr in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.append(addr[0])
+    except OSError:
+        pass
     ok = lambda ip: ipaddress.ip_address(ip).is_private and not ip.startswith(("127.", "169.254."))  # noqa: E731
     ips = list(dict.fromkeys(ip for ip in ips if ok(ip)))
     key = tuple(sorted(ips))
@@ -122,7 +118,8 @@ if quic:
 
         def __init__(self, *args, **kw):
             super().__init__(*args, **kw)
-            self.inbox, self.unframer = asyncio.Queue(), quic.Unframer()
+            self.inbox, self.unframer = asyncio.Queue(maxsize=256), quic.Unframer()
+            self.ended = False
 
         @classmethod
         async def open(cls, host, port, local_ip, pins, sid):
@@ -148,15 +145,27 @@ if quic:
         def quic_event_received(self, event):
             super().quic_event_received(event)
             if isinstance(event, StreamDataReceived) and event.stream_id == 0:
-                for m in self.unframer.feed(event.data):
-                    self.inbox.put_nowait(m)
+                try:
+                    for m in self.unframer.feed(event.data):
+                        self.inbox.put_nowait(m)
+                except (ValueError, asyncio.QueueFull):
+                    self.ended = True
+                    quic.Swept.close(self)
             elif isinstance(event, ConnectionTerminated):
+                self.ended = True
+            if self.ended:
+                while not self.inbox.empty():
+                    self.inbox.get_nowait()
                 self.inbox.put_nowait(None)
 
         async def recv(self):
+            if self.ended and self.inbox.empty():
+                return None
             return await self.inbox.get()
 
         async def send(self, data, video=False):
+            if self.ended:
+                raise ConnectionError("QUIC connection closed")
             if video:
                 stream = self._quic.get_next_available_stream_id(is_unidirectional=True)
                 self._quic.send_stream_data(stream, data, end_stream=True)
@@ -165,113 +174,14 @@ if quic:
             self.transmit()
 
         async def close(self, code=0):
-            quic.Swept.close(self)
+            self.ended = True
             try:
+                quic.Swept.close(self)
                 await asyncio.wait_for(self.wait_closed(), 2)
             except asyncio.TimeoutError:
                 pass
-            self._transport.close()
-
-
-class Session:
-    """One authenticated client: decrypt input -> SendInput, streamer output -> encrypt -> socket."""
-
-    def __init__(self, host, link, ch, via):
-        self.host, self.link, self.ch, self.via = host, link, ch, via
-        self.out = asyncio.Queue()
-        self.streamer = None
-        self.closing = False
-        self.keys, self.buttons = set(), set()
-
-    async def run(self):
-        loop = asyncio.get_running_loop()
-        emit = lambda data: loop.call_soon_threadsafe(self.out.put_nowait, data)  # noqa: E731
-        sender = asyncio.create_task(self.send_loop())
-        stats = asyncio.create_task(self.stats_loop())
-        try:
-            while (raw := await self.link.recv()) is not None:
-                data = self.ch.open(raw)
-                try:
-                    self.handle(data, emit)
-                except (struct.error, IndexError, ValueError) as e:  # malformed: drop it, keep the session
-                    log.warning("忽略格式错误的消息 0x%02x: %s", data[0] if data else 0, e)
-        except InvalidTag:
-            log.warning("丢弃无法解密的消息，断开")
-        finally:
-            if self.closing:  # let the sender deliver BYE and the close code; cancelling it would cut them off
-                try:
-                    await asyncio.wait_for(sender, 3)
-                except (asyncio.TimeoutError, ConnectionError, aiohttp.ClientError):
-                    pass
-            sender.cancel()
-            stats.cancel()
-            for sc in self.keys:  # never leave keys or buttons stuck down on the host
-                winput.key(sc, False)
-            for b in self.buttons:
-                winput.button(b, False)
-            self.host.deactivate(self)
-            if self.streamer:
-                self.streamer.stop()
-                await loop.run_in_executor(None, self.streamer.join, 2)
-
-    async def send_loop(self):
-        while True:
-            plain = await self.out.get()
-            await self.link.send(self.ch.seal(plain), video=plain[0] == VIDEO)
-            if plain[0] == BYE:
-                return await self.link.close(struct.unpack_from("<H", plain, 1)[0])
-
-    def close(self, code):
-        """End the session; the client is told why (BYE) and does not reconnect by itself."""
-        self.closing = True
-        self.out.put_nowait(struct.pack("<BH", BYE, code))
-
-    async def stats_loop(self, every=10):
-        while True:
-            await asyncio.sleep(every)
-            if not self.streamer:
-                continue
-            frames, size, rtt, base, kbps, allowance = self.streamer.take_stats()
-            if frames:  # silent while the screen is static
-                log.info("%s: %.0f fps, %.1f Mbps, 往返 平均 %.0f ms / 最低 %.0f ms, 码率 %d kbps, 排队上限 %.0f ms",
-                         self.via, frames / every, size * 8 / every / 1e6, rtt * 1000,
-                         base * 1000 if base != float("inf") else 0, kbps, allowance * 1000)
-
-    def handle(self, m, emit):
-        t = m[0]
-        if t == MOVE:
-            winput.move(*struct.unpack_from("<HH", m, 1))
-        elif t == BUTTON:
-            b, down = m[1], m[2]
-            (self.buttons.add if down else self.buttons.discard)(b)
-            winput.button(b, down)
-        elif t == WHEEL:
-            winput.wheel(*struct.unpack_from("<hh", m, 1))
-        elif t == KEY:
-            sc, down = struct.unpack_from("<HB", m, 1)
-            (self.keys.add if down else self.keys.discard)(sc)
-            winput.key(sc, down)
-        elif t == TEXT:
-            winput.text(m[1:].decode("utf-8", "replace"))
-        elif t == ACK and self.streamer:
-            self.streamer.ack(struct.unpack_from("<I", m, 1)[0])
-        elif t == KEYFRAME and self.streamer:
-            self.streamer.need_key = True
-        elif t == CONFIG:
-            kbps, fps = struct.unpack_from("<IB", m, 1)
-            kbps, fps = min(max(kbps, 500), 50000), min(max(fps, 5), 120)
-            if self.streamer:
-                self.streamer.configure(kbps, fps)
-            else:
-                # The client dials relay and LAN in parallel; only the connection it picks sends CONFIG,
-                # so this (not the handshake) is when it takes over from the previous session.
-                prev = self.host.activate(self)
-                self.streamer = Streamer(emit, kbps, fps, after=prev)
-                self.streamer.start()
-        elif t == PING:
-            self.out.put_nowait(bytes([PONG]) + m[1:])
-        elif t == NOTE:
-            log.info("手机报告: %s", m[1:301].decode("utf-8", "replace"))
+            finally:
+                self._transport.close()  # cancellation during shutdown must not orphan the UDP socket
 
 
 class Ui:
@@ -399,15 +309,21 @@ class Ui:
 
 
 class Host:
-    def __init__(self, cfg, open_window=False, show_event=None):
+    def __init__(self, cfg, open_window=False, show_event=None, reset_event=None, reset_done=None):
         self.open_window = open_window  # started from the desktop shortcut
         self.show_event = show_event
-        self.cfg = cfg
+        self.cfg = dict(cfg)
+        self.reset_event, self.reset_done = reset_event, reset_done
+        self.key_revision = 0
+        self.sessions, self.tasks = set(), set()
+        self.lan_runner = None
+        self.handshakes = 0
+        self.lan_clients = 0
         self.key = unb64(cfg["key"])
         self.relay = cfg["relay"]
         base = self.relay.replace("http", "ws", 1)  # http -> ws, https -> wss
         self.token = cfg["token"]
-        self.ctl_url = f"{base}/ws/host?id={cfg['id']}&token={cfg['token']}"
+        self.ctl_url = base + "/ws/host?" + urllib.parse.urlencode({"id": cfg["id"], "token": cfg["token"]})
         self.session_url = f"{base}/ws/s/"
         self.lan_port = cfg.get("lan_port", 47250)
         self.lan_ssl, self.lan_hosts = None, []
@@ -426,9 +342,8 @@ class Host:
         """Make `session` the one in control; returns the replaced session's streamer thread, if any."""
         prev = None
         if self.active is not None and self.active is not session:
+            prev = self.active.streamer
             self.active.close(CLOSE_REPLACED)
-            if prev := self.active.streamer:
-                prev.stop()  # one desktop duplication per output: the new streamer waits for this one to exit
         self.active = session
         log.info("手机已连接（%s），正在被远程控制", session.via)
         if self.ui:
@@ -460,6 +375,42 @@ class Host:
         if self.active:
             self.active.close(CLOSE_KICKED)
 
+    def reset_key(self):
+        """Persist first; then revoke all old sessions and in-progress handshakes on this loop."""
+        cfg = dict(self.cfg, key=b64(secrets.token_bytes(32)))
+        save_config(CONFIG_PATH, cfg)
+        self.cfg, self.key = cfg, unb64(cfg["key"])
+        self.key_revision += 1
+        for session in tuple(self.sessions):
+            session.close(CLOSE_KICKED)
+        if self.ui:
+            self.ui.open()
+        log.info("配对密钥已更新，旧配对和会话已撤销")
+
+    async def watch_commands(self):
+        k = ctypes.windll.kernel32
+        while True:
+            if k.WaitForSingleObject(self.reset_event, 0) == 0:
+                try:
+                    self.reset_key()
+                except (OSError, ValueError):
+                    log.exception("配对密钥更新失败，原配置已保留")
+                else:
+                    k.SetEvent(ctypes.c_void_p(self.reset_done))
+            await asyncio.sleep(0.15)
+
+    def spawn(self, coro):
+        task = asyncio.create_task(coro)
+        self.tasks.add(task)
+
+        def finished(done):
+            self.tasks.discard(done)
+            if not done.cancelled() and done.exception():
+                log.warning("后台连接任务失败: %s", type(done.exception()).__name__)
+
+        task.add_done_callback(finished)
+        return task
+
     async def serve(self, link, via):
         async def recv():
             data = await asyncio.wait_for(link.recv(), 10)
@@ -467,12 +418,29 @@ class Host:
                 raise AuthError("closed during handshake")
             return data
 
-        try:
-            ch = await host_handshake(recv, link.send, self.key)
-        except (AuthError, asyncio.TimeoutError) as e:
-            log.warning("拒绝未配对的连接: %s", e)
+        session = None
+        revision = self.key_revision
+        if self.handshakes >= 8 or len(self.sessions) >= 12:
+            await link.close(1013)
             return
-        await Session(self, link, ch, via).run()
+        self.handshakes += 1
+        try:
+            try:
+                ch = await asyncio.wait_for(host_handshake(recv, link.send, self.key), 10)
+                if revision != self.key_revision:
+                    raise AuthError("pairing key revoked")
+            finally:
+                self.handshakes -= 1
+            session = Session(self, link, ch, via, input_api=winput, streamer_factory=Streamer)
+            self.sessions.add(session)
+            await session.run()
+        except (AuthError, asyncio.TimeoutError, ConnectionError, aiohttp.ClientError) as e:
+            log.warning("连接结束: %s", type(e).__name__)
+        finally:
+            if session:
+                self.sessions.discard(session)
+            else:
+                await link.close()
 
     # -- relay --
     async def run(self):
@@ -480,11 +448,13 @@ class Host:
         self.ui = Ui(self.links, lambda: loop.call_soon_threadsafe(self.kick),
                      lambda: loop.call_soon_threadsafe(task.cancel), self.show_event)
         self.ui.status(*self.state)
-        await self.start_lan()
-        if self.open_window:
-            self.ui.open()
         http, route, backoff = None, "unset", 1
         try:
+            await self.start_lan()
+            if self.reset_event:
+                self.spawn(self.watch_commands())
+            if self.open_window:
+                self.ui.open()
             while True:
                 addr = await self.pick_route()
                 if addr != route or http is None:  # a new path: sessions on the old one belong to the old network
@@ -497,14 +467,14 @@ class Host:
                     async with http.ws_connect(self.ctl_url, heartbeat=20) as ctl:
                         log.info("已上线，等待手机连接")
                         if quic:
-                            asyncio.create_task(self.prefetch_wt(http))  # ready before the first UDP session
+                            self.spawn(self.prefetch_wt(http))  # ready before the first UDP session
                         self.set_state("已上线，手机可以连接了", GREEN)
                         backoff = 1
                         async for m in ctl:
                             if m.type == aiohttp.WSMsgType.TEXT and m.data.startswith("q:"):
-                                asyncio.create_task(self.accept_quic(http, m.data[2:]))
+                                self.spawn(self.accept_quic(http, m.data[2:]))
                             elif m.type == aiohttp.WSMsgType.TEXT:
-                                asyncio.create_task(self.accept(http, m.data))
+                                self.spawn(self.accept(http, m.data))
                     log.warning("与中转服务器的连接断开")
                     self.set_state("和服务器的连接断开，正在重连…", ORANGE)
                 except aiohttp.WSServerHandshakeError as e:
@@ -516,8 +486,18 @@ class Host:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
         finally:
+            for session in tuple(self.sessions):
+                session.close(CLOSE_KICKED)
+            tasks = tuple(self.tasks)
+            for pending in tasks:
+                pending.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             if http:
                 await http.close()
+            if self.lan_runner:
+                await self.lan_runner.cleanup()
+            # aiohttp closes SSL transports asynchronously; let their callbacks finish before asyncio.run exits.
+            await asyncio.sleep(0.25 if self.relay.startswith("https:") or self.lan_ssl else 0)
 
     async def pick_route(self):
         """Local address to reach the relay from: None = default route, or a NIC's address.
@@ -600,10 +580,16 @@ class Host:
             return
 
         async def handler(req):
+            if self.lan_clients >= 16:
+                raise web.HTTPTooManyRequests()
             log.info("局域网直连请求来自 %s", req.remote)
             ws = web.WebSocketResponse(max_msg_size=MAX_MSG, heartbeat=20)
-            await ws.prepare(req)
-            await self.serve(WsLink(ws), "局域网直连")
+            self.lan_clients += 1
+            try:
+                await ws.prepare(req)
+                await self.serve(WsLink(ws), "局域网直连")
+            finally:
+                self.lan_clients -= 1
             return ws
 
         # The PC also serves the web client. Browsers block a page from a public address (the relay) from
@@ -617,13 +603,18 @@ class Host:
                 m = json.load(f)
             return web.json_response(dict(m, name="MiniDesk 局域网", short_name="MiniDesk 局域网"))
 
+        async def client_cache_headers(req, response):
+            if req.path in ("/s/app.js", "/s/client-core.js"):
+                response.headers["Cache-Control"] = "no-cache, max-age=0, must-revalidate"
+
         app = web.Application()
+        app.on_response_prepare.append(client_cache_headers)
         app.router.add_get("/ws", handler)
         app.router.add_get("/ws/c/{id}", handler)
         app.router.add_get("/", index)
         app.router.add_get("/s/manifest.json", manifest)
         app.router.add_static("/s/", WEB_DIR)
-        runner = web.AppRunner(app, access_log=None)
+        runner = self.lan_runner = web.AppRunner(app, access_log=None, shutdown_timeout=3)
         await runner.setup()
         try:
             await web.TCPSite(runner, "0.0.0.0", self.lan_port, ssl_context=self.lan_ssl).start()
@@ -631,6 +622,8 @@ class Host:
         except OSError as e:
             log.warning("局域网直连端口 %d 不可用: %s", self.lan_port, e)
             self.lan_ssl = None
+            await runner.cleanup()
+            self.lan_runner = None
 
     def lan_urls(self):
         """Current LAN URLs; re-issues the certificate when the PC's addresses changed (DHCP, new Wi-Fi)."""
@@ -650,10 +643,7 @@ class Host:
 
 
 def load_config(a):
-    cfg = {}
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, encoding="utf-8") as f:
-            cfg = json.load(f)
+    cfg = read_config(CONFIG_PATH)
     if a.relay:
         cfg["relay"] = a.relay.rstrip("/")
     if a.token:
@@ -662,8 +652,7 @@ def load_config(a):
     if a.reset_key or "key" not in cfg:
         cfg["key"] = b64(secrets.token_bytes(32))
         a.pair = True
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    save_config(CONFIG_PATH, cfg)
     return cfg
 
 
@@ -707,7 +696,11 @@ _mutex = None
 
 def first_instance():
     global _mutex
-    _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\MiniDeskHost")
+    k = ctypes.windll.kernel32
+    k.CreateMutexW.restype = ctypes.c_void_p
+    _mutex = k.CreateMutexW(None, False, "Local\\MiniDeskHost")
+    if not _mutex:
+        raise ctypes.WinError()
     return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
 
 
@@ -724,6 +717,25 @@ def show_running():
     k.SetEvent(ctypes.c_void_p(ev))
     k.CloseHandle(ctypes.c_void_p(ev))
     return True
+
+
+def reset_running():
+    """Ask the owning process to rotate its key, and wait for successful persistence/revocation."""
+    k = ctypes.windll.kernel32
+    k.OpenEventW.restype = ctypes.c_void_p
+    k.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    request = k.OpenEventW(0x0002, False, RESET_EVENT)
+    done = k.OpenEventW(0x100002, False, RESET_DONE)  # SYNCHRONIZE | EVENT_MODIFY_STATE
+    try:
+        if not request or not done:
+            return False
+        k.ResetEvent(ctypes.c_void_p(done))
+        k.SetEvent(ctypes.c_void_p(request))
+        return k.WaitForSingleObject(ctypes.c_void_p(done), 5000) == 0
+    finally:
+        for handle in (request, done):
+            if handle:
+                k.CloseHandle(ctypes.c_void_p(handle))
 
 
 def message_box(text):
@@ -753,7 +765,8 @@ def main():
     p.add_argument("--start", action="store_true", help="(desktop shortcut) start and show the connect window")
     a = p.parse_args()
     if sys.stdout:  # None under pythonw: log to a file instead
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     else:
         handler = logging.handlers.RotatingFileHandler(os.path.join(HERE, "host.log"), maxBytes=1 << 20,
@@ -763,26 +776,40 @@ def main():
     if a.shortcut:
         return make_shortcut()
     first = first_instance()
-    cfg = load_config(a)
-    if not cfg.get("relay") or not cfg.get("token"):
-        p.error("首次运行需要 --relay 和 --token（或先运行 deploy.py）")
-    if a.pair and sys.stdout:  # under pythonw (the shortcut) the connect window shows them
-        show_pairing(cfg)
     if not first:
+        if a.reset_key:
+            if not reset_running():
+                p.error("未能确认密钥重置。请退出正在运行的 MiniDesk 后重新执行 --reset-key。")
+            print("配对密钥已更新，旧手机和会话已断开。")
+        if a.pair and sys.stdout:
+            show_pairing(read_config(CONFIG_PATH))
         if not a.start:
             print("MiniDesk 已在运行。改了 --relay/--token 的话，先在连接窗口点「退出 MiniDesk」再启动。")
         elif not show_running():  # an older version is running: it has no window to bring up
             message_box("MiniDesk 已经在运行，手机可以直接连接。")
         return
+    try:
+        cfg = load_config(a)
+    except (OSError, ValueError) as e:
+        p.error(str(e))
+    if a.pair and sys.stdout:
+        show_pairing(cfg)
     winput.init()
     k = ctypes.windll.kernel32
     k.CreateEventW.restype = ctypes.c_void_p
     k.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     show_event = k.CreateEventW(None, False, False, SHOW_EVENT)  # auto-reset
+    reset_event = k.CreateEventW(None, False, False, RESET_EVENT)
+    reset_done = k.CreateEventW(None, True, False, RESET_DONE)
     try:
-        asyncio.run(Host(cfg, open_window=a.start, show_event=show_event).run())
+        asyncio.run(Host(cfg, open_window=a.start, show_event=show_event,
+                         reset_event=reset_event, reset_done=reset_done).run())
     except (KeyboardInterrupt, asyncio.CancelledError):  # Ctrl+C, or 退出 MiniDesk in the connect window
         log.info("已退出")
+    finally:
+        for handle in (show_event, reset_event, reset_done, _mutex):
+            if handle:
+                k.CloseHandle(ctypes.c_void_p(handle))
 
 
 if __name__ == "__main__":

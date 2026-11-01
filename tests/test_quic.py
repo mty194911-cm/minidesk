@@ -34,6 +34,7 @@ from aioquic.quic.connection import QuicConnection  # noqa: E402
 from aioquic.quic.events import StreamDataReceived  # noqa: E402
 
 import mkcert  # noqa: E402
+from limits import STATE  # noqa: E402
 import quic  # noqa: E402
 import relay  # noqa: E402
 import winput  # noqa: E402
@@ -120,7 +121,7 @@ async def main():
             f.write(data)
     sctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     sctx.load_cert_chain(os.path.join(tmp, "s.crt"), os.path.join(tmp, "s.key"))
-    with socket.socket() as s1, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s2:
+    with socket.socket() as s1, socket.socket() as s2:
         s1.bind(("127.0.0.1", 0))
         s2.bind(("127.0.0.1", 0))
         port, lan_port = s1.getsockname()[1], s2.getsockname()[1]
@@ -145,10 +146,10 @@ async def main():
     host_task = asyncio.create_task(host.run())
     if runner:
         for _ in range(100):
-            if "testhost01" in app["hosts"]:
+            if "testhost01" in app[STATE]["hosts"]:
                 break
             await asyncio.sleep(0.1)
-        assert "testhost01" in app["hosts"], "host did not register"
+        assert "testhost01" in app[STATE]["hosts"], "host did not register"
     else:  # wait until the host reports it registered (route probing over a slow link takes a while)
         online, loop = asyncio.Event(), asyncio.get_running_loop()
 

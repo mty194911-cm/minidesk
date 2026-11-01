@@ -14,3 +14,7 @@ native/winput.c
 
 __pycache__/
 .ruff_cache/
+.pytest_cache/
+.venv/
+output/
+.playwright-cli/

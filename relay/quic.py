@@ -31,6 +31,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
+from limits import HOST_ID, MAX_CONTROL, MAX_MESSAGE, PAIR_TIMEOUT, SESSION_ID, STATE
+
 HOST_ALPN = "minidesk"
 log = logging.getLogger("relay")
 
@@ -157,17 +159,23 @@ class Unframer:
     """Reassembles [u32 len][payload] messages from a byte stream."""
 
     def __init__(self):
-        self.buf = b""
+        self.buf = bytearray()
 
     def feed(self, data):
-        self.buf += data
+        self.buf.extend(data)
         out = []
-        while len(self.buf) >= 4:
-            (n,) = struct.unpack_from("<I", self.buf)
-            if len(self.buf) < 4 + n:
+        offset = 0
+        while len(self.buf) - offset >= 4:
+            (n,) = struct.unpack_from("<I", self.buf, offset)
+            if not 1 <= n <= MAX_CONTROL:
+                self.buf.clear()
+                raise ValueError("invalid control message length")
+            if len(self.buf) - offset < 4 + n:
                 break
-            out.append(self.buf[4:4 + n])
-            self.buf = self.buf[4 + n:]
+            out.append(bytes(self.buf[offset + 4:offset + 4 + n]))
+            offset += 4 + n
+        if offset:
+            del self.buf[:offset]
         return out
 
 
@@ -196,11 +204,27 @@ class RelayProtocol(Swept):
 
     def __init__(self, *args, app, **kw):
         super().__init__(*args, **kw)
-        self.app, self.kind, self.peer, self.h3 = app, None, None, None
+        self.app, self.kind, self.peer, self.h3 = app[STATE], None, None, None
         self.session_id = None  # phone: WebTransport session (the CONNECT stream)
         self.ctl, self.ctl_backlog = None, b""  # phone: its control stream; host data that arrived before it
         self.uni = {}  # phone: host uni stream -> phone uni stream
         self.sid_buf = b""  # host: "<session id>\n" opens stream 0
+        self.joined = self.closing = False
+        self.release = self.client_release = None
+        self.pair_task = None
+        self.frame_sizes = {}
+        self.deadline = self._loop.call_later(PAIR_TIMEOUT, self.close)
+        app[STATE]["quic_protocols"].add(self)
+
+    def datagram_received(self, data, addr):
+        if not self.release:
+            self.release = self.app["quic_admission"].acquire(addr[0])
+            if self.release is None:
+                super().datagram_received(data, addr)  # establish the QUIC network path before sending CLOSE
+                self.close()
+                return
+            self.remote_ip = addr[0]
+        super().datagram_received(data, addr)
 
     def quic_event_received(self, event):
         super().quic_event_received(event)
@@ -209,7 +233,10 @@ class RelayProtocol(Swept):
             if self.kind == "phone":
                 self.h3 = H3Connection(self._quic, enable_webtransport=True)
         elif isinstance(event, ConnectionTerminated):
-            self.end_peer()
+            self.finish()
+            return
+        if self.closing:
+            return
         if self.kind == "phone":
             for e in self.h3.handle_event(event):
                 self.phone_event(e)
@@ -220,11 +247,11 @@ class RelayProtocol(Swept):
     def phone_event(self, e):
         if isinstance(e, HeadersReceived):
             h = dict(e.headers)
-            path = h.get(b":path", b"").decode()
+            path = h.get(b":path", b"").decode("ascii", "replace")
             if (h.get(b":method") == b"CONNECT" and h.get(b":protocol") == b"webtransport"
                     and path.startswith("/wt/c/") and self.session_id is None):
                 self.session_id = e.stream_id
-                asyncio.ensure_future(self.open_session(path[len("/wt/c/"):]))
+                self.pair_task = asyncio.create_task(self.open_session(path[len("/wt/c/"):]))
             else:
                 self.h3.send_headers(e.stream_id, [(b":status", b"404")], end_stream=True)
                 self.transmit()
@@ -236,35 +263,56 @@ class RelayProtocol(Swept):
                     self.ctl_backlog = b""
             if e.stream_id == self.ctl and self.peer:
                 self.peer.send_ctl(e.data)
+            elif self.peer:
+                self.close()  # input only uses one bidirectional control stream
         elif isinstance(e, DataReceived) and e.stream_id == self.session_id and e.stream_ended:
             self.close()  # the browser closed the session
 
     async def open_session(self, host_id):
         """Wake the host over its control WebSocket, wait for its QUIC connection, then accept the session."""
+        if not HOST_ID.fullmatch(host_id):
+            return self.reject(b"404")
+        self.client_release = self.app["admission"].acquire(self.remote_ip, host_id)
+        if self.client_release is None:
+            return self.reject(b"429")
         ctl = self.app["hosts"].get(host_id)
         if ctl is None:
             return self.reject(b"404")  # host offline
         sid = secrets.token_urlsafe(18)
-        fut = self.app["pending"][sid] = asyncio.get_running_loop().create_future()
+        fut = self.app["quic_pending"][sid] = asyncio.get_running_loop().create_future()
         try:
             await ctl.send_str("q:" + sid)
-            host = await asyncio.wait_for(fut, 10)
+            host = await asyncio.wait_for(fut, PAIR_TIMEOUT)
         except (asyncio.TimeoutError, ConnectionError):
             return self.reject(b"504")
         finally:
-            self.app["pending"].pop(sid, None)
+            self.app["quic_pending"].pop(sid, None)
+        if self.closing or host.closing:
+            return self.close()
         self.peer, host.peer = host, self
+        self.deadline.cancel()
+        host.deadline.cancel()
         self.h3.send_headers(self.session_id, [(b":status", b"200"), (b"sec-webtransport-http3-draft", b"draft02")])
         self.transmit()
+        if host.ctl_backlog:
+            self.send_ctl(host.ctl_backlog)
+            host.ctl_backlog = b""
 
     def reject(self, status):
         self.h3.send_headers(self.session_id, [(b":status", status)], end_stream=True)
         self.transmit()
+        if self.client_release:
+            self.client_release()
+            self.client_release = None
 
     def send_ctl(self, data):
+        if self.closing:
+            return
         if self.kind == "host":
             self._quic.send_stream_data(0, data)
         elif self.ctl is None:
+            if len(self.ctl_backlog) + len(data) > MAX_CONTROL:
+                return self.close()
             self.ctl_backlog += data
             return
         else:
@@ -272,31 +320,51 @@ class RelayProtocol(Swept):
         self.transmit()
 
     def forward_frame(self, host_stream, data, end):
+        size = self.frame_sizes.get(host_stream, 0) + len(data)
+        if size > MAX_MESSAGE or len(self.uni) >= 32 and host_stream not in self.uni:
+            return self.close()
+        self.frame_sizes[host_stream] = size
         sid = self.uni.get(host_stream)
         if sid is None:
             sid = self.uni[host_stream] = self.h3.create_webtransport_stream(self.session_id, is_unidirectional=True)
         self._quic.send_stream_data(sid, data, end_stream=end)
         if end:
             del self.uni[host_stream]
+            del self.frame_sizes[host_stream]
         self.transmit()
 
     # -- host side --
     def host_data(self, e):
         if e.stream_id != 0:  # a unidirectional stream: one video frame
-            if self.peer:
+            if self.peer and e.stream_id & 2:
                 self.peer.forward_frame(e.stream_id, e.data, e.end_stream)
+            else:
+                self.close()
         elif self.peer:
             self.peer.send_ctl(e.data)
         else:  # first bytes: the session id the relay handed out over the host's control WebSocket
-            self.sid_buf += e.data
-            if b"\n" in self.sid_buf:
-                sid, rest = self.sid_buf.split(b"\n", 1)
-                fut = self.app["pending"].get(sid.decode(errors="replace"))
+            if self.joined:
+                if len(self.ctl_backlog) + len(e.data) > MAX_CONTROL:
+                    return self.close()
+                self.ctl_backlog += e.data
+                return
+            separator = e.data.find(b"\n")
+            prefix = len(e.data) if separator < 0 else separator
+            if len(self.sid_buf) + prefix > 24:
+                self.sid_buf = b""
+                return self.close()
+            self.sid_buf += e.data[:prefix]
+            if separator >= 0:
+                sid, rest = self.sid_buf, e.data[separator + 1:]
+                self.sid_buf = b""
+                if not SESSION_ID.fullmatch(sid) or len(rest) > MAX_CONTROL:
+                    return self.close()
+                fut = self.app["quic_pending"].get(sid.decode())
                 if fut is None or fut.done():
                     return self.close()
+                self.joined = True
+                self.ctl_backlog = rest
                 fut.set_result(self)
-                if rest:
-                    self.peer.send_ctl(rest)
 
     # -- teardown --
     def end_peer(self):
@@ -306,14 +374,28 @@ class RelayProtocol(Swept):
             p.close()
 
     def close(self):
+        if self.closing:
+            return
+        self.closing = True
+        self.deadline.cancel()
+        if self.pair_task and self.pair_task is not asyncio.current_task():
+            self.pair_task.cancel()
         self.end_peer()
         self._quic.close()
         self.transmit()
 
+    def finish(self):
+        self.close()
+        self.app["quic_protocols"].discard(self)
+        for release in (self.release, self.client_release):
+            if release:
+                release()
+        self.release = self.client_release = None
+
 
 async def start(app, host, port):
     """Serve QUIC on UDP `port` and return the server (close() stops it). Rotates the certificate weekly;
-    app["wt"] tells clients where and what to pin."""
+    app[STATE]["wt"] tells clients where and what to pin."""
     cfg = configuration(False, alpn_protocols=H3_ALPN + [HOST_ALPN], max_datagram_frame_size=65536)
     hashes_ = []
 
@@ -321,10 +403,10 @@ async def start(app, host, port):
         cfg.certificate, cfg.private_key = make_cert()  # new connections use it; existing ones keep theirs
         hashes_.insert(0, base64.b64encode(cert_hash(cfg.certificate)).decode())
         del hashes_[2:]  # current + previous
-        app["wt"] = {"port": port, "hashes": list(hashes_)}
+        app[STATE]["wt"] = {"port": port, "hashes": list(hashes_)}
 
     rotate()
-    server = await serve(host, port, configuration=cfg,
+    server = await serve(host, port, configuration=cfg, retry=True,
                          create_protocol=lambda *a, **kw: RelayProtocol(*a, app=app, **kw))
     keep_listening(server._transport)
     log.info("UDP (QUIC/WebTransport) on port %d", port)
@@ -334,5 +416,14 @@ async def start(app, host, port):
             await asyncio.sleep(7 * 86400)
             rotate()
 
-    asyncio.ensure_future(rotate_weekly())
+    rotation = asyncio.create_task(rotate_weekly())
+
+    async def cleanup(_app):
+        rotation.cancel()
+        await asyncio.gather(rotation, return_exceptions=True)
+        for protocol in tuple(app[STATE]["quic_protocols"]):
+            protocol.finish()
+        server.close()
+
+    app[STATE]["quic_cleanup"] = cleanup
     return server

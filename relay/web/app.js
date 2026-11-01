@@ -9,6 +9,8 @@ const QUALITY_KBPS = [3000, 8000, 20000];  // caps: the host adapts the bitrate 
 // Served by the PC itself on its LAN port (not by the relay): every connection from this page is direct.
 const ON_LAN = /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(location.hostname);
 const FPS = 60;
+let streamFps = FPS;
+const { createInbox, CompositionCommitter, textChunks, SendQueue, DecodeQueue, FrameRenderer, gapDelay } = MiniDeskCore;
 
 const $ = id => document.getElementById(id);
 const stage = $('stage'), canvas = $('screen'), cursorEl = $('cursor'), ime = $('ime');
@@ -44,14 +46,14 @@ async function handshake(recv, send, K) {
   const kp = await S.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
   const cpub = new Uint8Array(await S.exportKey('raw', kp.publicKey));
   const nc = crypto.getRandomValues(new Uint8Array(16));
-  send(cat(cpub, nc));
+  await send(cat(cpub, nc));
   const r = await recv();
   if (!r || r.length !== 113) throw new AuthError('host closed');
   const hpub = r.subarray(0, 65), ns = r.subarray(65, 81), tag = r.subarray(81);
   const T = cat(cpub, hpub, nc, ns);
   const mk = await S.importKey('raw', K, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
   if (!await S.verify('HMAC', mk, tag, cat(te.encode('minidesk host'), T))) throw new AuthError('bad host');
-  send(new Uint8Array(await S.sign('HMAC', mk, cat(te.encode('minidesk client'), T))));
+  await send(new Uint8Array(await S.sign('HMAC', mk, cat(te.encode('minidesk client'), T))));
   const peer = await S.importKey('raw', hpub, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
   const shared = await S.deriveBits({ name: 'ECDH', public: peer }, kp.privateKey, 256);
   const hk = await S.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
@@ -96,8 +98,9 @@ let lastEnd = '';  // why the previous connection broke: reported to the PC (hos
 function post(pt) {
   const c = conn;
   if (!c) return;
-  // Sealing is async; chaining keeps the counters in send order.
-  c.chain = c.chain.then(async () => c.send(await c.chan.seal(pt))).catch(() => {});
+  c.sender ??= new SendQueue(async data => { if (!c.closed) await c.send(await c.chan.seal(data)); });
+  // Input may pass unsent ACKs; every message is still sealed/sent in one nonce-ordered worker.
+  c.chain = c.sender.push(pt).catch(e => { c.why ??= e?.message || '发送失败'; c.close(); });
 }
 function msg(type, size, fill) {
   const b = new Uint8Array(1 + size);
@@ -107,27 +110,33 @@ function msg(type, size, fill) {
 }
 const sendConfig = () => post(msg(CONFIG, 5, v => {
   v.setUint32(1, QUALITY_KBPS[quality], true);
-  v.setUint8(5, FPS);
+  v.setUint8(5, streamFps);
 }));
+const pressedButtons = new Set();
 const sendButton = (b, down) => {
+  if (down && !conn) return;
+  (down ? pressedButtons.add : pressedButtons.delete).call(pressedButtons, b);
   flushMove();
   post(msg(BUTTON, 2, v => { v.setUint8(1, b); v.setUint8(2, down ? 1 : 0); }));
 };
 const click = b => { sendButton(b, true); sendButton(b, false); };
 const sendKey = (sc, down) => post(msg(KEY, 3, v => { v.setUint16(1, sc, true); v.setUint8(3, down ? 1 : 0); }));
-let lastKeyReq = 0;
+let lastKeyReq = -Infinity, keyReqTimer = 0;
 function requestKey() {
+  if (!conn) return;
   const now = performance.now();
-  if (now - lastKeyReq > 500) { lastKeyReq = now; post(msg(KEYFRAME, 0)); }
+  if (now - lastKeyReq >= 500) {
+    clearTimeout(keyReqTimer);
+    keyReqTimer = 0;
+    lastKeyReq = now;
+    post(msg(KEYFRAME, 0));
+  } else if (!keyReqTimer) {
+    keyReqTimer = setTimeout(() => { keyReqTimer = 0; requestKey(); }, 501 - (now - lastKeyReq));
+  }
 }
 
 function inbox() {  // incoming messages of one connection; recv() resolves null once it is closed
-  const queue = [], waiters = [];
-  return {
-    push: d => waiters.length ? waiters.shift()(d) : queue.push(d),
-    recv: () => queue.length ? Promise.resolve(queue.shift()) : new Promise(r => waiters.push(r)),
-    end: () => waiters.splice(0).forEach(w => w(null)),
-  };
+  return createInbox();
 }
 
 function dial(url, K, rank) {  // WebSocket: LAN direct, or the relay's TCP fallback
@@ -136,12 +145,21 @@ function dial(url, K, rank) {  // WebSocket: LAN direct, or the relay's TCP fall
     sock.binaryType = 'arraybuffer';
     const box = inbox();
     const c = { rank, direct: rank === 2, recv: box.recv, chain: Promise.resolve(), onclose: null,
-                send: d => { if (sock.readyState === 1) sock.send(d); }, close: () => sock.close() };
+                send: d => {
+                  if (sock.readyState !== 1 || sock.bufferedAmount > 256 << 10) throw new Error('发送连接不可用');
+                  sock.send(d);
+                }, close: () => sock.close() };
     const timer = setTimeout(() => sock.close(), rank === 2 ? 2500 : 10000);
-    sock.onmessage = e => box.push(new Uint8Array(e.data));
+    sock.onmessage = e => {
+      const data = new Uint8Array(e.data);
+      data.receivedAt = performance.now();
+      if (!box.push(data)) c.close();
+    };
     sock.onclose = e => {
       c.why ??= `WebSocket 关闭 ${e.code}${e.reason ? ' ' + e.reason : ''}`;
       clearTimeout(timer);
+      c.closed = true;
+      c.closeCode = e.code;
       box.end();
       reject(Object.assign(new Error('closed'), { code: e.code }));
       c.onclose?.(e.code);
@@ -149,6 +167,7 @@ function dial(url, K, rank) {  // WebSocket: LAN direct, or the relay's TCP fall
     sock.onopen = async () => {
       try {
         c.chan = await handshake(c.recv, c.send, K);
+        if (c.closed) throw new Error('closed during handshake');
         clearTimeout(timer);
         resolve(c);
       } catch (e) {
@@ -175,27 +194,55 @@ async function readFramed(readable, push) {  // [u32 len][payload] messages from
       buf = buf.length ? cat(buf, value) : value;
       while (buf.length >= 4) {
         const n = new DataView(buf.buffer, buf.byteOffset, 4).getUint32(0, true);
+        if (!n || n > 64 << 10) throw new Error('控制消息过长');
         if (buf.length < 4 + n) break;
         push(buf.slice(4, 4 + n));
         buf = buf.subarray(4 + n);
       }
     }
-  } catch { /* session closed */ }
+  } finally { r.releaseLock(); }
 }
 async function readFrames(streams, push) {  // one video frame per unidirectional stream
   const r = streams.getReader();
+  let pending = 0, total = 0;
   try {
     for (;;) {
       const { value, done } = await r.read();
       if (done) return;
-      new Response(value).arrayBuffer().then(b => push(new Uint8Array(b)), () => {});
+      if (++pending > 32) { await value.cancel(); throw new Error('接收的视频帧过多'); }
+      // A bounded reader prevents malformed peers from buffering a giant video stream.
+      (async () => {
+        const reader = value.getReader(), chunks = [];
+        let size = 0;
+        try {
+          for (;;) {
+            const part = await reader.read();
+            if (part.done) break;
+            size += part.value.length;
+            total += part.value.length;
+            if (size > 8 << 20 || total > 16 << 20) { await reader.cancel(); throw new Error('视频帧过长'); }
+            chunks.push(part.value);
+          }
+          const data = new Uint8Array(size);
+          let offset = 0;
+          for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.length; }
+          push(data, null, true);
+        } finally { total -= size; pending--; reader.releaseLock(); }
+      })().catch(e => push(null, e));
     }
-  } catch { /* session closed */ }
+  } finally { r.releaseLock(); }
 }
 
 async function dialUdp(K) {  // WebTransport to the relay; its certificate is pinned by the hash /wt publishes
-  const info = await (await fetch('wt', { cache: 'no-store' })).json();
-  const wt = new WebTransport(`https://${location.hostname}:${info.port}/wt/c/${target}`, {
+  const id = target;
+  const abort = new AbortController(), fetchTimer = setTimeout(() => abort.abort(), 5000);
+  let info;
+  try {
+    const response = await fetch('wt', { cache: 'no-store', signal: abort.signal });
+    if (!response.ok) throw new Error('UDP unavailable');
+    info = await response.json();
+  } finally { clearTimeout(fetchTimer); }
+  const wt = new WebTransport(`https://${location.hostname}:${info.port}/wt/c/${id}`, {
     serverCertificateHashes: info.hashes.map(h => ({ algorithm: 'sha-256', value: b64d(h) })),
     congestionControl: 'low-latency',
   });
@@ -208,15 +255,20 @@ async function dialUdp(K) {  // WebTransport to the relay; its certificate is pi
   const timer = setTimeout(c.close, 15000);
   wt.closed.then(i => { c.why ??= `WebTransport 关闭 ${i?.closeCode ?? '-'} ${i?.reason || ''}`; },
                  e => { c.why ??= `WebTransport 出错 ${e?.message || e}`; })
-    .finally(() => { closed = true; clearTimeout(timer); box.end(); c.onclose?.(0); });
+    .finally(() => { closed = c.closed = true; c.closeCode = 0; clearTimeout(timer); box.end(); c.onclose?.(0); });
   try {
     await wt.ready;
     const ctl = await wt.createBidirectionalStream();
     const writer = ctl.writable.getWriter();
-    c.send = d => { if (!closed) writer.write(frame(d)).catch(() => {}); };
-    readFramed(ctl.readable, box.push);
-    readFrames(wt.incomingUnidirectionalStreams, box.push);
+    c.send = d => closed ? Promise.reject(new Error('连接已关闭')) : writer.write(frame(d));
+    const push = (data, error, video = false) => {
+      if (data) data.receivedAt = performance.now();
+      if (error || !data || !box.push(data, video)) { c.why ??= error?.message || '接收队列过长'; c.close(); }
+    };
+    readFramed(ctl.readable, push).catch(() => c.close());
+    readFrames(wt.incomingUnidirectionalStreams, push).catch(() => c.close());
     c.chan = await handshake(c.recv, c.send, K);
+    if (closed) throw new Error('closed during handshake');
   } catch (e) {
     c.close();
     throw e;
@@ -252,7 +304,7 @@ function open() {
     });
   };
   const tcp = () => {
-    if (tcpStarted) return;
+    if (tcpStarted || gen !== generation) return;
     tcpStarted = true;
     const ws = location.protocol === 'https:' ? 'wss' : 'ws';
     attempt(dial(`${ws}://${location.host}/ws/c/${target}`, K, ON_LAN ? 2 : 0));
@@ -268,17 +320,30 @@ function open() {
 
 function use(c) {
   const old = conn;
+  releaseAll();
   conn = c;
+  old?.sender?.close();
   old?.close();
   resetDecoder();
   resetReorder();
+  clearTimeout(keyReqTimer);
+  keyReqTimer = 0;
+  lastKeyReq = -Infinity;
+  sentX = sentY = -1;
+  moveDirty = true;
+  streamFps = FPS;
+  stats.frames = stats.bytes = stats.rtt = stats.decodeMs = stats.videoDelay = 0;
+  lastDecodeBackoff = -Infinity;
+  nextFpsProbe = performance.now() + 15000;
   retry = 0;
   hideMsg();
   toast(c.rank === 2 && !ON_LAN ? '已切换到局域网直连' : '', 1500);
   renderLan();
   c.since = c.lastRx = performance.now();
-  c.onclose = code => {
+  const finished = code => {
     if (conn !== c) return;
+    releaseAll();
+    c.sender?.close();
     conn = null;
     if (code === 4001) ended('电脑端断开了连接');
     else if (code === 4002) ended('已在另一台设备上连接');
@@ -290,13 +355,15 @@ function use(c) {
   (async () => {
     try {
       for (let d; (d = await c.recv());) {
-        c.lastRx = performance.now();
+        c.lastRx = Math.max(c.lastRx, d.receivedAt ?? performance.now());
         const m = await c.chan.open(d);
-        if (conn === c) handle(m);
+        if (conn === c) handle(m, d.receivedAt ?? c.lastRx);
       }
     } catch (e) {  // undecryptable message
       c.why ??= `${e?.name || '出错'}: ${e?.message || e}`;
       c.close();
+    } finally {
+      finished(c.closeCode || 0);  // drain queued BYE before treating a UDP close as a network failure
     }
   })();
 }
@@ -356,10 +423,14 @@ function renderLan() {
 
 function dropConn() {
   const c = conn;
+  releaseAll();
+  c?.sender?.close();
   conn = null;
   c?.close();
   resetDecoder();
-  releaseAll();
+  resetReorder();
+  clearTimeout(keyReqTimer);
+  keyReqTimer = 0;
 }
 
 function lost(text) {
@@ -392,10 +463,10 @@ function keepAwake() {
   if (!document.hidden) navigator.wakeLock?.request('screen').then(l => { wakeLock = l; }, () => {});
 }
 
-function handle(m) {
+function handle(m, received = performance.now()) {
   const v = new DataView(m.buffer, m.byteOffset, m.byteLength);
   switch (m[0]) {
-    case VIDEO: onVideo(m[1] === 1, v.getUint32(2, true), m.subarray(6)); break;
+    case VIDEO: onVideo(m[1] === 1, v.getUint32(2, true), m.subarray(6), received); break;
     case SCREEN: setScreen(v.getUint16(1, true), v.getUint16(3, true)); break;
     case CURSOR: onRemoteCursor(v.getInt16(1, true), v.getInt16(3, true)); break;
     case LAN: {
@@ -416,8 +487,15 @@ function handle(m) {
 }
 
 // ---- video ----
-let decoder = null, W = 0, H = 0, everShown = false;
-const stats = { frames: 0, bytes: 0, rtt: 0 };
+let decoder = null, decodeQueue = null, decoderEpoch = 0, decodeStamp = 0;
+let W = 0, H = 0, everShown = false, lastDecodeBackoff = 0, nextFpsProbe = 0;
+const frameTimes = new Map();
+const stats = { frames: 0, bytes: 0, rtt: 0, decodeMs: 0, videoDelay: 0 };
+const renderer = new FrameRenderer(f => {
+  ctx2d.drawImage(f, 0, 0);
+  stats.frames++;
+  if (!everShown) { everShown = true; firstFrameHints(); }
+});
 
 function codecOf(au) {  // "avc1.PPCCLL" from the SPS in an Annex-B access unit
   for (let i = 0; i + 6 < au.length; i++) {
@@ -429,63 +507,113 @@ function codecOf(au) {  // "avc1.PPCCLL" from the SPS in an Annex-B access unit
 }
 
 function resetDecoder() {
+  decoderEpoch++;
+  decodeQueue?.close();
+  decodeQueue = null;
+  renderer.clear();
+  frameTimes.clear();
   if (decoder && decoder.state !== 'closed') decoder.close();
   decoder = null;
 }
 
 function onFrame(f) {
-  ctx2d.drawImage(f, 0, 0);
-  f.close();
-  stats.frames++;
-  if (!everShown) { everShown = true; firstFrameHints(); }
+  const timing = frameTimes.get(f.timestamp), now = performance.now();
+  frameTimes.delete(f.timestamp);
+  if (timing) {
+    stats.decodeMs += 0.2 * (now - timing.submitted - stats.decodeMs);
+    stats.videoDelay += 0.2 * (now - timing.arrived - stats.videoDelay);
+  }
+  // During catch-up, paint only the latest decoded frame each display tick. Normal frames paint immediately.
+  renderer.push(f, !!decodeQueue?.pending.length || frameTimes.size > 0);
+  decodeQueue?.drain();
+}
+
+function decoderOverload() {
+  resetReorder();
+  resetDecoder();
+  const now = performance.now();
+  if (now - lastDecodeBackoff >= 1000) {
+    streamFps = Math.max(10, Math.floor(streamFps / 2));
+    sendConfig();
+  }
+  lastDecodeBackoff = now;
+  nextFpsProbe = now + 15000;
+  requestKey();
+}
+
+function startDecodeQueue(codec) {
+  decodeQueue = new DecodeQueue({
+    size: () => Math.max(codec.decodeQueueSize, frameTimes.size),
+    submit: ({ key, au, arrived }) => {
+      const now = performance.now();
+      const stamp = decodeStamp = Math.max(decodeStamp + 1, Math.round(now * 1000));
+      frameTimes.set(stamp, { arrived, submitted: now });
+      codec.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: stamp, data: au }));
+    },
+    stall: decoderOverload,
+  });
+  codec.addEventListener?.('dequeue', () => { if (codec === decoder) decodeQueue?.drain(); });
 }
 
 // Over UDP every frame has its own stream, so frames can complete out of order: decode strictly in sequence.
-// A keyframe that overtakes missing frames restarts from itself; a gap open for 1 s asks for a fresh keyframe.
-let nextSeq = 0, gapTimer = 0;
+// Request a new reference frame after a bounded, RTT-aware gap instead of freezing for a whole second.
+let nextSeq = 0, gapTimer = 0, waitingForKey = true;
 const early = new Map();
 function resetReorder() {
   nextSeq = 0;
+  waitingForKey = true;
   early.clear();
   clearTimeout(gapTimer);
   gapTimer = 0;
 }
-function onVideo(key, seq, au) {
+function onVideo(key, seq, au, received = performance.now()) {
   post(msg(ACK, 4, v => v.setUint32(1, seq, true)));
   stats.bytes += au.length;
+  if (waitingForKey && !key) return requestKey();
   if (nextSeq && seq < nextSeq) return;  // late duplicate
   if (!nextSeq || (key && seq > nextSeq && !early.has(nextSeq))) {
+    if (nextSeq) resetDecoder();
     early.clear();
     nextSeq = seq;
+    waitingForKey = false;
   }
-  early.set(seq, [key, au]);
+  early.set(seq, [key, au, received]);
+  if (early.size > 32) { resetReorder(); resetDecoder(); return requestKey(); }
   while (early.has(nextSeq)) {
-    const [k, a] = early.get(nextSeq);
+    const [k, a, arrived] = early.get(nextSeq);
     early.delete(nextSeq++);
-    decodeFrame(k, a);
+    decodeFrame(k, a, arrived);
   }
   if (!early.size) {
     clearTimeout(gapTimer);
     gapTimer = 0;
   } else if (!gapTimer) {
-    gapTimer = setTimeout(() => { resetReorder(); resetDecoder(); requestKey(); }, 1000);
+    gapTimer = setTimeout(() => { resetReorder(); resetDecoder(); requestKey(); }, gapDelay(stats.rtt));
   }
 }
-function decodeFrame(key, au) {
+function decodeFrame(key, au, arrived = performance.now()) {
   if (key && (!decoder || decoder.state !== 'configured')) {
     const codec = codecOf(au);
     if (codec) {
       resetDecoder();
-      decoder = new VideoDecoder({ output: onFrame, error: () => { decoder = null; requestKey(); } });
+      const epoch = decoderEpoch;
+      decoder = new VideoDecoder({
+        output: frame => { if (epoch === decoderEpoch) onFrame(frame); else frame.close(); },
+        error: () => { if (epoch === decoderEpoch) { resetReorder(); resetDecoder(); requestKey(); } },
+      });
       decoder.configure({ codec, optimizeForLatency: true });
+      startDecodeQueue(decoder);
     }
   }
   if (!decoder || decoder.state !== 'configured') return requestKey();
-  decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: performance.now() * 1000, data: au }));
+  decodeQueue?.push({ key, au, arrived });
 }
 
 function setScreen(w, h) {
+  const alreadyDecoding = decoder !== null;
   resetDecoder();  // the next keyframe reconfigures
+  resetReorder();
+  if (alreadyDecoding) requestKey();  // the initial encoder already sends its own IDR
   if (w === W && h === H) return;
   W = canvas.width = w;
   H = canvas.height = h;
@@ -770,6 +898,7 @@ stage.addEventListener('pointermove', e => {
   else if (g.n === 3 && pts.size >= 3) moveThree();
 });
 function pointerEnd(e) {
+  if (e.type !== 'pointerup') { cancelPointers(); return; }
   if (e.pointerType === 'mouse') {
     if (conn && e.button < 3 && e.type === 'pointerup') sendButton(MOUSE_BUTTON[e.button], false);
     return;
@@ -785,6 +914,7 @@ function pointerEnd(e) {
 }
 stage.addEventListener('pointerup', pointerEnd);
 stage.addEventListener('pointercancel', pointerEnd);
+stage.addEventListener('lostpointercapture', cancelPointers);
 stage.addEventListener('wheel', e => {
   e.preventDefault();
   if (e.ctrlKey) return zoomTo(view.s * Math.exp(-e.deltaY * 0.002), e.clientX, e.clientY);  // also trackpad pinch
@@ -812,8 +942,20 @@ const SC = Object.fromEntries((
 
 const held = new Set();      // physical keys currently down (hardware keyboard)
 const latched = new Map();   // sticky modifiers from the key bar: scancode -> button
+const repeatStops = new Set();
+
+function cancelPointers() {
+  for (const button of [...pressedButtons]) sendButton(button, false);
+  clearTimeout(g?.timer);
+  pts.clear();
+  g = null;
+  fling = null;
+  wheel.x = wheel.y = 0;
+}
 
 function releaseAll() {
+  cancelPointers();
+  for (const stop of repeatStops) stop();
   for (const sc of held) sendKey(sc, false);
   held.clear();
   releaseLatched();
@@ -828,15 +970,21 @@ function tapKey(sc) {
   releaseLatched();
 }
 function combo(...codes) {
+  releaseLatched();
   for (const c of codes) sendKey(SC[c], true);
   for (const c of codes.reverse()) sendKey(SC[c], false);
 }
-function typeText(s) {
+async function typeText(s) {
   if (!s) return;
   const code = /^[a-z]$/i.test(s) ? 'Key' + s.toUpperCase() : /^[0-9]$/.test(s) ? 'Digit' + s : null;
   if (latched.size && code) return tapKey(SC[code]);  // Ctrl+C etc. need scancodes, not Unicode
-  post(cat(Uint8Array.of(TEXT), te.encode(s)));
   releaseLatched();
+  const connection = conn;
+  for (const chunk of textChunks(s)) {
+    if (!connection || conn !== connection || connection.closed || connection.sender?.closed) break;
+    post(cat(Uint8Array.of(TEXT), te.encode(chunk)));
+    await connection.chain;
+  }
 }
 
 document.addEventListener('keydown', e => {  // hardware keyboard: send scancodes, the host's IME does the rest
@@ -849,7 +997,7 @@ document.addEventListener('keydown', e => {  // hardware keyboard: send scancode
 });
 document.addEventListener('keyup', e => {
   const sc = SC[e.code];
-  if (!conn || e.target === ime || !held.delete(sc)) return;
+  if (!conn || !held.delete(sc)) return;
   e.preventDefault();
   sendKey(sc, false);
 });
@@ -860,21 +1008,19 @@ addEventListener('blur', () => { if (conn) releaseAll(); });
 // A sentinel keeps Backspace working on an "empty" field; the preview shows pinyin / the word being composed,
 // which would otherwise be invisible.
 const SENTINEL = '​​';
-let composing = false, lastCommit = { text: '', t: 0 };
+let composing = false;
+const committer = new CompositionCommitter(typeText);
 function resetIme() { ime.value = SENTINEL; ime.setSelectionRange(SENTINEL.length, SENTINEL.length); }
 function showPreview(text) { previewEl.textContent = text; previewEl.hidden = !text; }
 function commit(text) {
-  // Some browsers repeat a composition's text as insertText right after compositionend.
-  if (!text || (text === lastCommit.text && performance.now() - lastCommit.t < 50)) return;
-  lastCommit = { text, t: performance.now() };
-  typeText(text);
+  committer.direct(text);
 }
-ime.addEventListener('compositionstart', () => { composing = true; });
+ime.addEventListener('compositionstart', () => { composing = true; committer.start(); });
 ime.addEventListener('compositionupdate', e => showPreview(e.data));
-ime.addEventListener('compositionend', e => { composing = false; showPreview(''); commit(e.data); resetIme(); });
+ime.addEventListener('compositionend', e => { composing = false; showPreview(''); committer.end(e.data); resetIme(); });
 ime.addEventListener('input', e => {
   if (composing || e.isComposing) return;
-  if (e.inputType === 'insertText') commit(e.data);
+  if (e.inputType === 'insertText' || e.inputType === 'insertFromComposition') committer.input(e.data);
   else if (e.inputType === 'deleteContentBackward') tapKey(SC.Backspace);
   else if (e.inputType === 'insertLineBreak' || e.inputType === 'insertParagraph') tapKey(SC.Enter);
   resetIme();
@@ -898,6 +1044,7 @@ async function pasteFromPhone() {
 // shortcuts can stay on screen without it covering half the view.
 const keyboardOpen = () => kbdEl.classList.contains('show');
 function setKeyboard(open, soft = open) {
+  if (!open) releaseLatched();
   kbdEl.classList.toggle('show', open);
   if (open && soft) { resetIme(); ime.focus({ preventScroll: true }); } else ime.blur();
   renderKeyboard();
@@ -932,6 +1079,7 @@ const keyButtons = KEY_BAR.map(([label, action, kind]) => {
   const run = typeof action === 'function' ? action : () => tapKey(SC[action]);
   let timer = 0;
   const stop = () => clearTimeout(timer);
+  repeatStops.add(stop);
   b.addEventListener('pointerdown', e => {
     e.preventDefault();  // keep focus (and the phone's keyboard) on the textarea
     if (kind === 'click') return;
@@ -1061,14 +1209,21 @@ setInterval(() => {
   if (idle > 3000 && conn.rank === 1) rescue(conn);
   post(msg(PING, 8, v => v.setFloat64(1, performance.now(), true)));
   const rtt = stats.rtt;
+  const now = performance.now();
+  if (streamFps < FPS && stats.frames && stats.videoDelay < 40 && now >= nextFpsProbe && now - lastDecodeBackoff >= 15000) {
+    streamFps = Math.min(FPS, streamFps + 5);
+    nextFpsProbe = now + 10000;
+    sendConfig();
+  }
   fab.style.setProperty('--dot', rtt < 60 ? '#30d158' : rtt < 150 ? '#ffd60a' : '#ff453a');
   statsEl.textContent = `${PATH_NAMES[conn.rank]} · ${stats.frames} fps · ` +
-    `${(stats.bytes * 8 / 1e6).toFixed(1)} Mbps · ${rtt.toFixed(0)} ms`;
+    `${(stats.bytes * 8 / 1e6).toFixed(1)} Mbps · 往返 ${rtt.toFixed(0)} ms · 画面处理 ${stats.videoDelay.toFixed(0)} ms`;
   stats.frames = stats.bytes = 0;
 }, 1000);
 
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden || !target) return;
+  if (document.hidden) { releaseAll(); wakeLock?.release().catch(() => {}); return; }
+  if (!target) return;
   if (conn) { conn.lastRx = performance.now(); requestKey(); keepAwake(); }  // grace period after background
   else if (retryTimer) { retry = 0; open(); }  // back from background: retry now
 });

@@ -90,9 +90,8 @@ class Streamer(threading.Thread):
 
     def configure(self, kbps, fps):
         self.cap_kbps = self._target = kbps
-        if fps != self.fps:
-            self.fps = fps
-            self.need_reconfig = True
+        # PTS uses wall-clock milliseconds. Changing capture cadence does not require a new H.264 encoder/IDR.
+        self.fps = fps
 
     def stop(self):
         self.running = False
@@ -103,11 +102,12 @@ class Streamer(threading.Thread):
         now = time.perf_counter()
         with self._cv:
             sent = self._sent_at.pop(seq, None)
+            if sent is None:
+                return  # duplicated or invented ACKs must not advance the flow-control window
             self._acked = max(self._acked, seq)
-            if sent is not None:
-                self._unacked -= sent[1]
-                self._acked_bytes += sent[1]
-                self._rtt_sample(now - sent[0], now)
+            self._unacked -= sent[1]
+            self._acked_bytes += sent[1]
+            self._rtt_sample(now - sent[0], now)
             self._cv.notify()
 
     def _rtt_sample(self, rtt, now):
@@ -174,16 +174,28 @@ class Streamer(threading.Thread):
             self.need_reconfig = True
         return enc
 
+    def _wait_for_budget(self, enc):
+        while self.running:
+            with self._cv:
+                if not self._queueing(time.perf_counter()):
+                    break
+                started = time.perf_counter()
+                self._cv.wait(0.05)
+                self._blocked += time.perf_counter() - started
+            # A long network stall must not also suspend the congestion controller.
+            enc = self._adapt(enc)
+        return enc
+
     def _adapt(self, enc):
-        """Every 0.5 s. Congestion is a standing queue (even the fastest round trip of the step rose above the
+        """Every 0.25 s. Congestion is a standing queue (even the fastest round trip of the step rose above the
         base, while the gate held frames back, or by a lot; loss and jitter only delay single frames) or the
-        average round trip doubling (on 4G some frames slip through fast while the rest queue). Then drop to
+        average round trip rising by half the base, 80 ms at least (some mobile frames still slip through fast). Drop to
         ~85% of what got delivered, by 40% at most (light content sends little anyway); an encoder that cannot
         go lower is left to the gate. Otherwise, after 1 s, climb 25% per step, only 5% within 0.8-1.2x the rate
         that last congested, and never past 1.5x the path's capacity: probing straight past those sawed."""
         now = time.perf_counter()
         period = now - self._adapt_t
-        if period < 0.5:
+        if period < 0.25:
             return enc
         self._adapt_t = now
         with self._cv:
@@ -191,24 +203,25 @@ class Streamer(threading.Thread):
             delivered = self._rate = self._acked_bytes * 8 / period / 1000
             self._blocked, self._rtt_lo, self._rtt_sum = 0.0, math.inf, 0.0
             self._rtt_n = self._acked_bytes = 0
-        if n < 3:  # (nearly) static screen: too few round trips to tell
+        if not n or n < 3 and blocked < 0.2 * period:  # sparse content gives no capacity evidence unless backlogged
             return enc
         mean = rtt_sum / n
-        self._spread += 0.2 * (mean - lo - self._spread)
+        step = min(period / 0.5, 2.0)
+        self._spread += (1 - 0.8 ** step) * (mean - lo - self._spread)
         queueing, allowance = lo - base, self.allowance()  # a standing queue delays even the fastest frame
         if (queueing > allowance / 2 and blocked > 0.2 * period or queueing > allowance
-                or mean - base > max(base, 0.15)):
-            self._capacity += 0.3 * (delivered - self._capacity)  # the path's limit (smoothed: ACKs come in bursts)
+                or mean - base > max(0.5 * base, 0.08)):
+            self._capacity += (1 - 0.7 ** step) * (delivered - self._capacity)
             self._calm = 0
             self._ceiling = self.kbps
             kbps = max(MIN_KBPS, min(self.kbps, int(max(delivered, 0.7 * self.kbps) * 0.85)))
         else:  # holding back without a queue is the gate's caution (loss, jitter): no measure of the path
             self._capacity = max(self._capacity, delivered)
-            self._calm += 1
-            if self._calm < 2:
+            self._calm += period
+            if self._calm < 1.0:
                 return enc
             fast = not 0.8 * self._ceiling <= self.kbps <= 1.2 * self._ceiling
-            kbps = int(self.kbps * 1.25) + 200 if fast else int(self.kbps * 1.05) + 50
+            kbps = int(self.kbps * (1.25 if fast else 1.05) ** step + (200 if fast else 50) * step)
             kbps = min(self.cap_kbps, kbps, max(self.kbps, int(1.5 * self._capacity)))
         return self._set_kbps(enc, kbps) if kbps != self.kbps else enc
 
@@ -236,26 +249,25 @@ class Streamer(threading.Thread):
         # Two buffers take turns (the encoder copies its input before encode() returns): allocating a fresh
         # 15 MB frame each time cost ~1000 page faults per frame.
         frame, last, cursor = new_frame(w, h), new_frame(w, h), None
-        have_last, refine, next_t = False, 0, 0.0
+        have_last, refine, next_t, last_change = False, 0, 0.0, 0.0
         while self.running:
             if self._target:
                 kbps, self._target = self._target, 0
                 enc = self._set_kbps(enc, kbps)
             enc = self._adapt(enc)
+            enc = self._wait_for_budget(enc)
+            if not self.running:
+                break
             if self.need_reconfig:
                 self.need_reconfig = False
                 enc = self._open(w, h)
-            with self._cv:
-                if self._queueing(time.perf_counter()):
-                    t0 = time.perf_counter()
-                    while self.running and self._queueing(time.perf_counter()):
-                        self._cv.wait(0.25)  # an ACK notifies
-                    self._blocked += time.perf_counter() - t0
             delay = next_t - time.perf_counter()
             if delay > 0:
                 time.sleep(delay)
 
-            r = cap.grab(100, frame.planes[0], frame.planes[0].line_size)
+            started = time.perf_counter()
+            # DXGI wakes on actual updates; a short idle timeout bounds keyframe/refinement response time.
+            r = cap.grab(16, frame.planes[0], frame.planes[0].line_size)
             if r == capture.LOST:  # resolution change, desktop switch...
                 return
             c = (cap.pointer_x, cap.pointer_y, cap.pointer_visible)
@@ -263,11 +275,14 @@ class Streamer(threading.Thread):
                 cursor = c
                 self.emit(struct.pack("<Bhhb", CURSOR, *c))
             if r == capture.FRAME:
+                last_change = time.perf_counter()
                 last, frame, have_last = frame, last, True
                 refine = 2
-                next_t = time.perf_counter() + 1 / self.fps
+                period = 1 / self.fps
+                # Anchor to frame starts, so capture time does not get added to every frame interval.
+                next_t = started + period if not next_t or started - next_t > period else next_t + period
                 self._encode(enc, last)
-            elif r == capture.TIMEOUT and have_last and (self.need_key or refine):
+            elif have_last and (self.need_key or refine and time.perf_counter() - last_change >= 0.1):
                 # Static screen: serve keyframe requests, and re-encode twice so text sharpens.
                 if not self.need_key:
                     refine -= 1

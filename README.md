@@ -1,8 +1,8 @@
 # MiniDesk
 
-**极简远程桌面：用手机浏览器触控操作 Windows 电脑。手机端只是一个 54 KB 的网页，安卓无需安装任何 App。**
+**极简远程桌面：用手机浏览器触控操作 Windows 电脑。手机端约 68 KB，安卓无需安装任何 App。**
 
-*A tiny remote desktop: control your Windows PC from the phone's browser. The phone side is a 54 KB web page — nothing to install on Android.*
+*A tiny remote desktop: control your Windows PC from the phone's browser. The phone side is about 68 KB — nothing to install on Android.*
 
 ToDesk 一类工具的极简版：只做两件事——看屏幕、控制鼠标和键盘，其余功能一概不要，目标是延迟最低、代码最少。
 
@@ -10,10 +10,10 @@ ToDesk 一类工具的极简版：只做两件事——看屏幕、控制鼠标�
 
 | 部分 | 代码 | 压缩后 |
 |---|---|---|
-| 手机端（网页：HTML + JS） | **54 KB** | 19 KB |
-| 电脑端（Python + Cython/C++ 采集与输入） | **71 KB** | 24 KB |
-| 中转服务器（Python） | **21 KB** | 7 KB |
-| 合计（约 3600 行，含部署脚本） | 156 KB | 53 KB |
+| 手机端（网页：HTML + JS） | **68 KB** | 23 KB |
+| 电脑端（Python + Cython/C++ 采集与输入） | **85 KB** | 28 KB |
+| 中转服务器（Python） | **30 KB** | 9 KB |
+| 核心实现合计（不含测试和部署脚本） | 约 183 KB | 约 60 KB |
 
 网页端不用任何框架，也没有构建步骤；加密只用浏览器自带的 WebCrypto。电脑端运行时依赖 Python 和 PyAV（自带 FFmpeg，用来做 H.264 编码），这些不算在上表里。
 
@@ -23,12 +23,13 @@ ToDesk 一类工具的极简版：只做两件事——看屏幕、控制鼠标�
 - **低延迟**：
   - 电脑端用 DXGI 桌面复制采集（Cython，不占 GIL），用 NVENC 硬件编码（零延迟参数）；手机端用 WebCodecs 硬件解码。
   - 2560×1440 下采集 2.9 ms、编码 6.2 ms（RTX 4060）。
-  - 同一 Wi-Fi 时直连电脑：实测往返 4–10 ms，30–50 fps。
+  - 同一 Wi-Fi 时直连电脑：此前真机实测往返 4–10 ms。最新调度与延迟对比见 [PERFORMANCE.md](PERFORMANCE.md)。
+  - 帧率按完整帧周期调度；浏览器消化短暂突发、按显示节奏合并追帧，只在持续积压时降帧，并能在恢复后逐步回升。
 - **网络差也扛得住**：
   - 经服务器时走 UDP（QUIC / WebTransport），每帧单独一条流，丢一个包只耽误那一帧。
   - 端到端的排队控制和自适应码率不让数据在路上堆积；本机模拟 10% 丢包时仍有约 30 fps。
   - 浏览器不支持或 UDP 被封时，自动退回 TCP。
-- **端到端加密**：ECDH + AES-GCM，配对密钥只在二维码里。中转服务器只转发密文，看不到画面，也冒充不了任何一端。
+- **端到端加密**：ECDH + AES-GCM，配对密钥通过二维码交给手机。在客户端网页代码可信的前提下，中转转发的密文无法被它解密或冒充。
 - **手机打中文不用切电脑输入法**：手机输入法打出的文字以 Unicode 直接注入电脑，中英文只在手机上切换。
 - **为触屏设计**：
   - 触控板和触控两种模式；双指滚动（带惯性）、捏合缩放，三指平移。
@@ -87,7 +88,7 @@ python deploy.py 你的服务器公网IP
   ```bash
   cd minidesk-relay
   python3 -m venv venv
-  venv/bin/pip install aiohttp "aioquic>=1.3,<1.8"
+  venv/bin/pip install -r requirements.txt
   sudo MINIDESK_TOKEN=$(python3 -c "import json; print(json.load(open('relay.json'))['token'])") \
       venv/bin/python relay.py --port 443 --cert server.crt --key server.key
   ```
@@ -123,10 +124,20 @@ python host.py --shortcut
 ## 测试
 
 ```bash
+pip install -r requirements-dev.txt
+python -m pytest -q                     # 无桌面依赖的回归；安装 Node.js 后也会运行 JS 状态测试
+python tests/run_integration.py e2e-tls --synthetic  # 临时证书、模拟画面、真实 TLS/LAN 链路
+python tests/run_integration.py quic --synthetic --loss 0.1
+python tests/run_integration.py e2e-tls   # Windows 原生采集、真实编码；不改部署证书
+python tests/run_integration.py quic
 python tests/test_e2e.py [--tls]          # 端到端：配对、直连切换、踢出
 python tests/test_quic.py [--loss 0.1 --busy --nodecode]   # UDP 路径与丢包
 python tests/test_adapt.py                # 模拟晚高峰线路和 4G 下的排队与码率
 ```
+
+测试环境、真实浏览器回归和兼容性说明见 [TESTING.md](TESTING.md)。Windows 安装器使用 Python 3.10+，在独立虚拟环境安装依赖，避免升级全局环境；升级时会先准备新环境。运行中的主机支持 `python host.py --reset-key` 即时撤销旧配对及会话；升级前已经启动的旧进程需要先退出，再启动新版。
+
+网页代码本身属于信任边界：服务器同时提供 JS，若服务器被攻陷，恶意 JS 可以读取浏览器保存的配对密钥。HTTPS 和端到端加密仍需要配合可信的网页分发。自建根证书私钥只保存在电脑端，应按私钥管理。
 
 ## 许可
 
